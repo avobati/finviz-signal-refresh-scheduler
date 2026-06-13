@@ -1,0 +1,123 @@
+name: Refresh Finviz signals
+
+on:
+  schedule:
+    # Primary run after US close plus settlement time.
+    - cron: "30 23 * * 1-5"
+    # Watchdog retry. UTC day is the following day for the same US session.
+    - cron: "30 4 * * 2-6"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Run even when production reports current data
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: finviz-production-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Check out scheduler
+        uses: actions/checkout@v4
+
+      - name: Check whether refresh is needed
+        id: gate
+        shell: bash
+        env:
+          FORCE: ${{ inputs.force || 'false' }}
+          STATUS_URL: https://finviz-lead-indicator.vercel.app/api/refresh-status
+        run: |
+          should_run=true
+          if [ "$FORCE" != "true" ]; then
+            if status_json="$(curl --fail --silent --show-error --max-time 30 "$STATUS_URL")"; then
+              is_stale="$(STATUS_JSON="$status_json" python -c "import json,os; print(str(bool(json.loads(os.environ['STATUS_JSON']).get('is_stale', True))).lower())")"
+              if [ "$is_stale" = "false" ]; then
+                should_run=false
+              fi
+            fi
+          fi
+          echo "should_run=$should_run" >> "$GITHUB_OUTPUT"
+          echo "Refresh required: $should_run"
+
+      - name: Check out private application
+        if: steps.gate.outputs.should_run == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: avobati/finviz-lead-indicator
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          path: app
+
+      - name: Set up Python
+        if: steps.gate.outputs.should_run == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: app/scripts/requirements.txt
+
+      - name: Install dependencies
+        if: steps.gate.outputs.should_run == 'true'
+        run: pip install -r app/scripts/requirements.txt
+
+      - name: Run signal tests
+        if: steps.gate.outputs.should_run == 'true'
+        working-directory: app
+        run: python -m unittest discover -s scripts -p "test_*.py"
+
+      - name: Refresh daily and weekly signals
+        if: steps.gate.outputs.should_run == 'true'
+        working-directory: app
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        shell: bash
+        run: |
+          for attempt in 1 2 3; do
+            echo "Refresh attempt $attempt of 3"
+            if python scripts/sync_finviz_wavetrend.py \
+              --chunk-size 80 \
+              --sleep-ms 600 \
+              --settle-minutes 90 \
+              --download-retries 2; then
+              exit 0
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              sleep $((attempt * 300))
+            fi
+          done
+          exit 1
+
+      - name: Verify production freshness
+        if: steps.gate.outputs.should_run == 'true'
+        shell: bash
+        env:
+          STATUS_URL: https://finviz-lead-indicator.vercel.app/api/refresh-status
+        run: |
+          for attempt in 1 2 3; do
+            status_json="$(curl --fail --silent --show-error --max-time 30 "$STATUS_URL")"
+            if STATUS_JSON="$status_json" python -c "import json,os,sys; s=json.loads(os.environ['STATUS_JSON']); print(json.dumps(s, indent=2)); sys.exit(0 if s.get('hasSuccessfulRun') and not s.get('is_stale') and s.get('tickers_scanned') == 11056 else 1)"; then
+              exit 0
+            fi
+            sleep 30
+          done
+          exit 1
+
+      - name: Record scheduler heartbeat
+        if: steps.gate.outputs.should_run == 'true'
+        shell: bash
+        run: |
+          printf 'Last successful scheduler run: %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" > .last-successful-run
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .last-successful-run
+          git commit -m "Record successful refresh $(date -u +'%Y-%m-%d')" || exit 0
+          git push
